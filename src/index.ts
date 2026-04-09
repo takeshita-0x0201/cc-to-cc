@@ -5,6 +5,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
+import * as http from "node:http";
+import * as net from "node:net";
 import { z } from "zod/v4";
 
 // ---------------------------------------------------------------------------
@@ -36,6 +38,7 @@ interface ProjectEntry {
   path: string;
   description: string;
   registeredAt: string;
+  webhookPort?: number;
 }
 
 function readRegistry(): Record<string, ProjectEntry> {
@@ -62,11 +65,112 @@ interface Message {
 }
 
 // ---------------------------------------------------------------------------
+// Notification queue — receives push from HTTP webhook
+// ---------------------------------------------------------------------------
+interface Notification {
+  messageId: string;
+  from: string;
+  subject: string;
+  timestamp: string;
+}
+
+const pendingNotifications: Notification[] = [];
+
+// Resolvers for watch tool — wake up waiting watchers on push
+let watchResolvers: Array<(n: Notification) => void> = [];
+
+function pushNotification(n: Notification) {
+  // If someone is watching, wake them up immediately
+  if (watchResolvers.length > 0) {
+    const resolver = watchResolvers.shift()!;
+    resolver(n);
+  } else {
+    pendingNotifications.push(n);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP webhook server — receives notifications from other MCP instances
+// ---------------------------------------------------------------------------
+let webhookServer: http.Server | null = null;
+let webhookPort: number | null = null;
+
+function startWebhookServer(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = http.createServer((req, res) => {
+      if (req.method === "POST" && req.url === "/notify") {
+        let body = "";
+        req.on("data", (chunk) => (body += chunk));
+        req.on("end", () => {
+          try {
+            const notification: Notification = JSON.parse(body);
+            pushNotification(notification);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+          } catch {
+            res.writeHead(400);
+            res.end("Invalid JSON");
+          }
+        });
+        return;
+      }
+      // Health check
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end("Not found");
+    });
+
+    // Find a random available port
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address() as net.AddressInfo;
+      webhookServer = srv;
+      webhookPort = addr.port;
+      resolve(addr.port);
+    });
+    srv.on("error", reject);
+  });
+}
+
+// Send HTTP notification to a peer's webhook
+async function notifyPeer(port: number, notification: Notification): Promise<boolean> {
+  return new Promise((resolve) => {
+    const payload = JSON.stringify(notification);
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: "/notify",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+        timeout: 3000,
+      },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode === 200);
+      }
+    );
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.end(payload);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 const server = new McpServer({
   name: "cc-to-cc",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 // --- register --------------------------------------------------------------
@@ -74,7 +178,7 @@ server.registerTool(
   "register",
   {
     description:
-      "Register this project so other Claude Code sessions can find and message it. Run this once per project.",
+      "Register this project so other Claude Code sessions can find and message it. Starts a webhook listener for real-time notifications. Run this once per session.",
     inputSchema: {
       id: z
         .string()
@@ -91,12 +195,18 @@ server.registerTool(
     },
   },
   async ({ id, projectPath, description }) => {
+    // Start webhook server if not already running
+    if (!webhookServer) {
+      await startWebhookServer();
+    }
+
     const reg = readRegistry();
     reg[id] = {
       id,
       path: projectPath,
       description: description ?? "",
       registeredAt: new Date().toISOString(),
+      webhookPort: webhookPort!,
     };
     writeRegistry(reg);
 
@@ -109,7 +219,7 @@ server.registerTool(
       content: [
         {
           type: "text" as const,
-          text: `Registered project "${id}" (${projectPath}). Inbox ready at ${projectDir(id)}/inbox/`,
+          text: `Registered project "${id}" (${projectPath}). Webhook listening on port ${webhookPort}. Use the "watch" tool to wait for incoming messages in real-time.`,
         },
       ],
     };
@@ -135,7 +245,10 @@ server.registerTool(
       };
     }
     const lines = entries.map(
-      (e) => `- ${e.id}: ${e.description || "(no description)"} [${e.path}]`
+      (e) => {
+        const status = e.webhookPort ? `webhook:${e.webhookPort}` : "no webhook";
+        return `- ${e.id}: ${e.description || "(no description)"} [${e.path}] (${status})`;
+      }
     );
     return {
       content: [
@@ -153,7 +266,7 @@ server.registerTool(
   "send",
   {
     description:
-      "Send a message to another project's Claude Code session.",
+      "Send a message to another project's Claude Code session. If the recipient is watching, they will be notified in real-time.",
     inputSchema: {
       to: z
         .string()
@@ -194,16 +307,31 @@ server.registerTool(
       timestamp: new Date().toISOString(),
     };
 
+    // Write message to recipient's inbox
     const dir = inboxNew(to);
     fs.mkdirSync(dir, { recursive: true });
     const filePath = path.join(dir, `${msg.id}.json`);
     fs.writeFileSync(filePath, JSON.stringify(msg, null, 2));
 
+    // Push webhook notification to recipient if they have an active listener
+    let pushStatus = "no webhook";
+    const targetPort = reg[to].webhookPort;
+    if (targetPort) {
+      const notification: Notification = {
+        messageId: msg.id,
+        from: msg.from,
+        subject: msg.subject,
+        timestamp: msg.timestamp,
+      };
+      const ok = await notifyPeer(targetPort, notification);
+      pushStatus = ok ? "notified in real-time" : "webhook unreachable (message saved to inbox)";
+    }
+
     return {
       content: [
         {
           type: "text" as const,
-          text: `Message sent to "${to}" (thread: ${msg.threadId}). Subject: ${subject}`,
+          text: `Message sent to "${to}" (thread: ${msg.threadId}). Subject: ${subject}. Delivery: ${pushStatus}.`,
         },
       ],
     };
@@ -259,6 +387,117 @@ server.registerTool(
         {
           type: "text" as const,
           text: `${messages.length} new message(s):\n\n${formatted}`,
+        },
+      ],
+    };
+  }
+);
+
+// --- watch ------------------------------------------------------------------
+server.registerTool(
+  "watch",
+  {
+    description:
+      "Wait for incoming messages in real-time. Blocks until a new message arrives or timeout is reached. Use this to make your session reactive — when another project sends you a message, this tool returns immediately with the notification. Call this in a loop to continuously listen.",
+    inputSchema: {
+      projectId: z.string().describe("Your project ID"),
+      timeoutSeconds: z
+        .number()
+        .optional()
+        .describe(
+          "How long to wait for a message (default: 30 seconds, max: 120 seconds)"
+        ),
+    },
+  },
+  async ({ projectId, timeoutSeconds }) => {
+    const timeout = Math.min(timeoutSeconds ?? 30, 120) * 1000;
+
+    // Check for already-queued notifications first
+    if (pendingNotifications.length > 0) {
+      const n = pendingNotifications.shift()!;
+      // Read the full message from inbox
+      const msgPath = path.join(inboxNew(projectId), `${n.messageId}.json`);
+      if (fs.existsSync(msgPath)) {
+        const msg: Message = JSON.parse(fs.readFileSync(msgPath, "utf-8"));
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `New message received!\n\n---\nID: ${msg.id}\nFrom: ${msg.from}\nSubject: ${msg.subject}\nThread: ${msg.threadId}\nTime: ${msg.timestamp}\n\n${msg.body}\n\n---\nUse "ack" to acknowledge, then "send" to reply on the same threadId.`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Notification received from ${n.from}: "${n.subject}" — but message file not found. It may have been already processed.`,
+          },
+        ],
+      };
+    }
+
+    // Wait for a webhook push or timeout
+    const notification = await new Promise<Notification | null>((resolve) => {
+      const timer = setTimeout(() => {
+        // Remove this resolver on timeout
+        watchResolvers = watchResolvers.filter((r) => r !== resolver);
+        resolve(null);
+      }, timeout);
+
+      const resolver = (n: Notification) => {
+        clearTimeout(timer);
+        resolve(n);
+      };
+      watchResolvers.push(resolver);
+    });
+
+    if (!notification) {
+      // Timeout — also do a filesystem check as fallback
+      const dir = inboxNew(projectId);
+      if (fs.existsSync(dir)) {
+        const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+        if (files.length > 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Watch timed out, but found ${files.length} message(s) in inbox. Use "inbox" to read them.`,
+              },
+            ],
+          };
+        }
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `No messages received within ${Math.round(timeout / 1000)} seconds. Call "watch" again to keep listening.`,
+          },
+        ],
+      };
+    }
+
+    // Got a notification — read the full message
+    const msgPath = path.join(inboxNew(projectId), `${notification.messageId}.json`);
+    if (fs.existsSync(msgPath)) {
+      const msg: Message = JSON.parse(fs.readFileSync(msgPath, "utf-8"));
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `New message received!\n\n---\nID: ${msg.id}\nFrom: ${msg.from}\nSubject: ${msg.subject}\nThread: ${msg.threadId}\nTime: ${msg.timestamp}\n\n${msg.body}\n\n---\nUse "ack" to acknowledge, then "send" to reply on the same threadId.`,
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Notification from ${notification.from}: "${notification.subject}" — message file not found.`,
         },
       ],
     };
