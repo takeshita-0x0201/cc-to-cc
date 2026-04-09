@@ -1,0 +1,31 @@
+{
+  "name": "cc-to-cc",
+  "version": "0.1.0",
+  "description": "Cross-project communication between Claude Code sessions via file-based mailbox",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "cc-to-cc": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "claude-code",
+    "mcp",
+    "cross-project",
+    "inter-session",
+    "communication"
+  ],
+  "author": "takeshita-0x0201",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "typescript": "^6.0.2"
+  }
+}
