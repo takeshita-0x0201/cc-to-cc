@@ -24,6 +24,9 @@ function inboxNew(projectId: string) {
 function inboxCur(projectId: string) {
   return path.join(projectDir(projectId), "inbox", "cur");
 }
+function inboxArchive(projectId: string) {
+  return path.join(projectDir(projectId), "inbox", "archive");
+}
 
 // ---------------------------------------------------------------------------
 // Registry helpers
@@ -100,6 +103,7 @@ server.registerTool(
     // Ensure inbox dirs exist
     fs.mkdirSync(inboxNew(id), { recursive: true });
     fs.mkdirSync(inboxCur(id), { recursive: true });
+    fs.mkdirSync(inboxArchive(id), { recursive: true });
 
     return {
       content: [
@@ -272,9 +276,15 @@ server.registerTool(
       messageId: z
         .string()
         .describe("The message ID to acknowledge"),
+      archive: z
+        .boolean()
+        .optional()
+        .describe(
+          "If true, move directly to archive instead of cur. Useful for messages that need no further reference."
+        ),
     },
   },
-  async ({ projectId, messageId }) => {
+  async ({ projectId, messageId, archive: shouldArchive }) => {
     const src = path.join(inboxNew(projectId), `${messageId}.json`);
     if (!fs.existsSync(src)) {
       return {
@@ -287,15 +297,116 @@ server.registerTool(
       };
     }
 
-    const dst = path.join(inboxCur(projectId), `${messageId}.json`);
-    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    const destDir = shouldArchive
+      ? inboxArchive(projectId)
+      : inboxCur(projectId);
+    const dst = path.join(destDir, `${messageId}.json`);
+    fs.mkdirSync(destDir, { recursive: true });
     fs.renameSync(src, dst);
+
+    const action = shouldArchive ? "acknowledged and archived" : "acknowledged";
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Message ${messageId} ${action}.`,
+        },
+      ],
+    };
+  }
+);
+
+// --- archive ----------------------------------------------------------------
+server.registerTool(
+  "archive",
+  {
+    description:
+      "Archive read messages to keep cur/ clean. Moves messages from cur to archive. Supports archiving by message ID, thread ID, or all at once.",
+    inputSchema: {
+      projectId: z.string().describe("Your project ID"),
+      messageId: z
+        .string()
+        .optional()
+        .describe("Archive a specific message by ID"),
+      threadId: z
+        .string()
+        .optional()
+        .describe("Archive all messages in a specific thread"),
+      all: z
+        .boolean()
+        .optional()
+        .describe("Archive all messages in cur/"),
+    },
+  },
+  async ({ projectId, messageId, threadId, all: archiveAll }) => {
+    const curDir = inboxCur(projectId);
+    const archDir = inboxArchive(projectId);
+    fs.mkdirSync(archDir, { recursive: true });
+
+    if (!fs.existsSync(curDir)) {
+      return {
+        content: [
+          { type: "text" as const, text: "No read messages to archive." },
+        ],
+      };
+    }
+
+    const files = fs.readdirSync(curDir).filter((f) => f.endsWith(".json"));
+    let toArchive: string[] = [];
+
+    if (messageId) {
+      const fname = `${messageId}.json`;
+      if (files.includes(fname)) {
+        toArchive = [fname];
+      } else {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Message ${messageId} not found in cur/.`,
+            },
+          ],
+        };
+      }
+    } else if (threadId) {
+      toArchive = files.filter((f) => {
+        const msg: Message = JSON.parse(
+          fs.readFileSync(path.join(curDir, f), "utf-8")
+        );
+        return msg.threadId === threadId;
+      });
+      if (toArchive.length === 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `No messages found for thread ${threadId}.`,
+            },
+          ],
+        };
+      }
+    } else if (archiveAll) {
+      toArchive = files;
+    } else {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "Specify messageId, threadId, or all: true.",
+          },
+        ],
+      };
+    }
+
+    for (const f of toArchive) {
+      fs.renameSync(path.join(curDir, f), path.join(archDir, f));
+    }
 
     return {
       content: [
         {
           type: "text" as const,
-          text: `Message ${messageId} acknowledged.`,
+          text: `Archived ${toArchive.length} message(s).`,
         },
       ],
     };
@@ -314,20 +425,36 @@ server.registerTool(
         .string()
         .optional()
         .describe("Filter by thread ID to see a specific conversation"),
+      includeArchived: z
+        .boolean()
+        .optional()
+        .describe(
+          "Include archived messages in results. Default: false (only shows cur/)."
+        ),
     },
   },
-  async ({ projectId, threadId }) => {
-    const dir = inboxCur(projectId);
-    if (!fs.existsSync(dir)) {
+  async ({ projectId, threadId, includeArchived }) => {
+    const dirs = [inboxCur(projectId)];
+    if (includeArchived) {
+      dirs.push(inboxArchive(projectId));
+    }
+
+    let messages: Message[] = [];
+    for (const dir of dirs) {
+      if (!fs.existsSync(dir)) continue;
+      const files = fs.readdirSync(dir).filter((f: string) => f.endsWith(".json"));
+      for (const f of files) {
+        messages.push(
+          JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8"))
+        );
+      }
+    }
+
+    if (messages.length === 0) {
       return {
         content: [{ type: "text" as const, text: "No message history." }],
       };
     }
-
-    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
-    let messages: Message[] = files.map((f) =>
-      JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8"))
-    );
 
     if (threadId) {
       messages = messages.filter((m) => m.threadId === threadId);
