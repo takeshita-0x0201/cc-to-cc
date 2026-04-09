@@ -8,21 +8,29 @@
 
 ## English
 
-Different Claude Code sessions running in different project directories can send and receive messages to each other through a shared file-based mailbox.
+Different Claude Code sessions running in different project directories can send and receive messages to each other through a shared file-based mailbox with real-time webhook notifications.
 
 ### How it works
 
 ```
-Claude Code (Project A)          Claude Code (Project B)
-        │                                │
-   MCP Server                       MCP Server
-   (cc-to-cc)                       (cc-to-cc)
-        │                                │
-        └──── ~/.cc-to-cc/inbox/ ────────┘
-                (shared filesystem)
+Project A (sender)                     Project B (receiver)
+─────────────────                      ──────────────────
+Claude Code                            Claude Code
+  │                                      │
+  └─ send("prproj-api", ...)            watch("prproj-api")  ← waiting
+       │                                      ▲
+       ├─ 1. Write JSON to inbox              │
+       │                                      │
+       └─ 2. HTTP POST ──────────────────────┘
+              localhost:PORT/notify            │
+                                        3. watch returns instantly
+                                        4. Claude Code reads & responds
 ```
 
-Each Claude Code session gets a set of MCP tools (`send`, `inbox`, `list_peers`, etc.). Messages are JSON files written to a shared directory (`~/.cc-to-cc/`). No central server needed — just the filesystem.
+- **File-based mailbox**: Messages are JSON files in `~/.cc-to-cc/`. No central server.
+- **Real-time push**: Each session runs a local HTTP webhook. `send` POSTs a notification to the recipient — `watch` returns instantly.
+- **Offline-safe**: If the recipient is offline, messages are saved to their inbox and read later.
+- **Multi-project**: 2, 3, or 10 projects — same mechanism. Each project gets its own inbox.
 
 ### Setup
 
@@ -54,38 +62,62 @@ Replace `/absolute/path/to/cc-to-cc` with the actual path where you cloned the r
 
 #### 3. Register each project
 
-In each Claude Code session, run:
+In each Claude Code session:
 
 ```
 register this project as "my-project-id"
 ```
 
-This creates the inbox and adds the project to the registry.
+This creates the inbox, starts the webhook listener, and adds the project to the registry.
 
 ### MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `register` | Register this project with an ID so others can find it |
-| `list_peers` | List all registered projects |
-| `send` | Send a message to another project |
-| `inbox` | Check for new messages |
-| `ack` | Mark a message as read |
-| `history` | View past messages, optionally filtered by thread |
+| `register` | Register this project with an ID. Starts the webhook listener. |
+| `list_peers` | List all registered projects and their online status. |
+| `send` | Send a message to another project. Pushes a real-time notification. |
+| `inbox` | Check for new (unread) messages. |
+| `watch` | Wait for incoming messages in real-time. Returns instantly when a message arrives. |
+| `ack` | Mark a message as read. Optionally archive it directly. |
+| `archive` | Move read messages to archive (by message, thread, or all). |
+| `history` | View past messages. Optionally include archived ones. |
 
-### Example conversation
+### Message lifecycle
 
-**In Project A (ad-automation-pro):**
 ```
-"Send a message to prproj-api asking for the current API endpoint list"
+inbox/new/  →  inbox/cur/  →  inbox/archive/
+ (unread)       (read)        (processed)
 ```
 
-**In Project B (prproj-api):**
-```
-"Check my inbox"
-→ New message from ad-automation-pro: "Please list current API endpoints"
+- `ack` moves new → cur (or directly to archive with `archive: true`)
+- `archive` moves cur → archive (by message ID, thread ID, or all at once)
+- `history` shows cur/ by default; set `includeArchived: true` to search archive
+- `inbox` and `watch` only show new/
 
-"Reply with the endpoint list"
+### Example: real-time conversation
+
+**Terminal 1 — Project B (prproj-api):**
+```
+> "Watch for incoming messages"
+  → Calls watch("prproj-api") — waiting...
+```
+
+**Terminal 2 — Project A (ad-automation-pro):**
+```
+> "Ask prproj-api for the current API endpoint list"
+  → Calls send(to: "prproj-api", from: "ad-automation-pro", ...)
+  → "Message sent. Delivery: notified in real-time."
+```
+
+**Terminal 1 — Project B receives instantly:**
+```
+  → "New message received!
+     From: ad-automation-pro
+     Subject: API endpoint list request
+     ..."
+  → Claude Code reads the message, checks its codebase, and replies
+  → Calls send(to: "ad-automation-pro", from: "prproj-api", ...)
 ```
 
 ### Message format
@@ -114,21 +146,29 @@ Messages are stored as JSON files in `~/.cc-to-cc/projects/<project-id>/inbox/`:
 
 ## 日本語
 
-異なるプロジェクトディレクトリで動作する Claude Code セッション同士が、ファイルベースのメールボックスを通じてメッセージを送受信できます。
+異なるプロジェクトディレクトリで動作する Claude Code セッション同士が、ファイルベースのメールボックスとリアルタイム webhook 通知を通じてメッセージを送受信できます。
 
 ### 仕組み
 
 ```
-Claude Code (プロジェクトA)       Claude Code (プロジェクトB)
-        │                                │
-   MCP サーバー                     MCP サーバー
-   (cc-to-cc)                       (cc-to-cc)
-        │                                │
-        └──── ~/.cc-to-cc/inbox/ ────────┘
-              (共有ファイルシステム)
+プロジェクト A（送信側）                プロジェクト B（受信側）
+──────────────────                    ──────────────────
+Claude Code                           Claude Code
+  │                                     │
+  └─ send("prproj-api", ...)           watch("prproj-api")  ← 待機中
+       │                                     ▲
+       ├─ 1. JSON を inbox に書き込み         │
+       │                                     │
+       └─ 2. HTTP POST ────────────────────┘
+              localhost:PORT/notify           │
+                                       3. watch が即座に返る
+                                       4. Claude Code がメッセージを読んで反応
 ```
 
-各 Claude Code セッションに MCP ツール（`send`, `inbox`, `list_peers` 等）が追加されます。メッセージは共有ディレクトリ（`~/.cc-to-cc/`）に JSON ファイルとして保存されます。中央サーバーは不要で、ファイルシステムだけで動作します。
+- **ファイルベース**: メッセージは `~/.cc-to-cc/` に JSON ファイルとして保存。中央サーバー不要。
+- **リアルタイム通知**: 各セッションがローカル HTTP webhook を起動。`send` が受信側に POST → `watch` が即座に返る。
+- **オフライン対応**: 受信側がオフラインでもメッセージは inbox に保存され、後で読める。
+- **マルチプロジェクト**: 2 つでも 10 でも同じ仕組み。各プロジェクトに専用 inbox。
 
 ### セットアップ
 
@@ -166,32 +206,56 @@ npm run build
 このプロジェクトを "my-project-id" として登録して
 ```
 
-これにより inbox が作成され、プロジェクトがレジストリに追加されます。
+これにより inbox が作成され、webhook リスナーが起動し、プロジェクトがレジストリに追加されます。
 
 ### MCP ツール一覧
 
 | ツール | 説明 |
 |--------|------|
-| `register` | プロジェクトを ID で登録し、他のセッションから発見可能にする |
-| `list_peers` | 登録済みの全プロジェクトを一覧表示 |
-| `send` | 他のプロジェクトにメッセージを送信 |
-| `inbox` | 新着メッセージを確認 |
-| `ack` | メッセージを既読にする |
-| `history` | 過去のメッセージを表示（スレッドでフィルタ可能） |
+| `register` | プロジェクトを ID で登録。webhook リスナーを起動。 |
+| `list_peers` | 登録済みの全プロジェクトとオンライン状態を一覧表示。 |
+| `send` | 他のプロジェクトにメッセージを送信。リアルタイム通知を push。 |
+| `inbox` | 新着（未読）メッセージを確認。 |
+| `watch` | リアルタイムでメッセージを待機。届いた瞬間に返る。 |
+| `ack` | メッセージを既読にする。直接アーカイブも可能。 |
+| `archive` | 既読メッセージをアーカイブに移動（個別 / スレッド / 一括）。 |
+| `history` | 過去のメッセージを表示。アーカイブを含めることも可能。 |
 
-### 使用例
+### メッセージのライフサイクル
 
-**プロジェクト A（ad-automation-pro）にて：**
 ```
-「prproj-api に現在の API エンドポイント一覧を聞いて」
+inbox/new/  →  inbox/cur/  →  inbox/archive/
+  (未読)        (既読)         (処理済み)
 ```
 
-**プロジェクト B（prproj-api）にて：**
-```
-「受信箱を確認して」
-→ ad-automation-pro からの新着メッセージ：「API エンドポイント一覧を教えてください」
+- `ack` — new → cur に移動（`archive: true` で直接アーカイブも可）
+- `archive` — cur → archive に移動（メッセージ ID / スレッド ID / 一括）
+- `history` — デフォルトは cur/ のみ。`includeArchived: true` でアーカイブも検索
+- `inbox` と `watch` は new/ のみ表示
 
-「エンドポイント一覧を返信して」
+### 使用例：リアルタイム会話
+
+**ターミナル 1 — プロジェクト B（prproj-api）：**
+```
+> 「受信メッセージを待って」
+  → watch("prproj-api") を呼び出し — 待機中...
+```
+
+**ターミナル 2 — プロジェクト A（ad-automation-pro）：**
+```
+> 「prproj-api に API エンドポイント一覧を聞いて」
+  → send(to: "prproj-api", from: "ad-automation-pro", ...) を呼び出し
+  → 「メッセージ送信完了。配信: リアルタイム通知済み。」
+```
+
+**ターミナル 1 — プロジェクト B が即座に受信：**
+```
+  → 「新着メッセージ受信！
+     送信元: ad-automation-pro
+     件名: API endpoint list request
+     ...」
+  → Claude Code がメッセージを読み、コードベースを確認し、返信
+  → send(to: "ad-automation-pro", from: "prproj-api", ...) を呼び出し
 ```
 
 ### メッセージ形式
